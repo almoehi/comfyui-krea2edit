@@ -53,6 +53,19 @@ def _imgids_offset(bs, frame, gh, gw, th, tw, device):
     return ids.reshape(1, gh * gw, 3).repeat(bs, 1, 1)
 
 
+def _imgids_scaled(bs, frame, gh, gw, vh, vw, th, tw, device):
+    """A downscaled ref (gh x gw tokens) laid over the vh x vw grid it was fitted to:
+    each token sits at the centre of the patch of target positions it covers
+    (stride vh/gh), the fitted grid centred in the target like _imgids_offset."""
+    sh, sw = vh / gh, vw / gw
+    off_h, off_w = max(0.0, (th - vh) / 2), max(0.0, (tw - vw) / 2)
+    ids = torch.zeros(gh, gw, 3, device=device, dtype=torch.float32)
+    ids[..., 0] = frame
+    ids[..., 1] = (off_h + (torch.arange(gh, device=device, dtype=torch.float32) + 0.5) * sh - 0.5)[:, None]
+    ids[..., 2] = (off_w + (torch.arange(gw, device=device, dtype=torch.float32) + 0.5) * sw - 0.5)[None, :]
+    return ids.reshape(1, gh * gw, 3).repeat(bs, 1, 1)
+
+
 def _to_4d(v):
     """(B,C,T,H,W) -> (B*T,C,H,W); pass 4D through. Images use T=1."""
     if v.ndim == 5:
@@ -76,12 +89,17 @@ def _fit_src(src, H, W):
     return F.interpolate(src.float(), size=(H, W), mode="bilinear")
 
 
-def _fit_encode_image(image, vae, H, W, cache, key, fit_mode="crop"):
+def _scaled_grid(nh, nw, scale):
+    """Pixel size of a reference rendered at `scale` of its fitted size (/16 grid, >= 16)."""
+    return (max(16, int(round(nh * scale / 16)) * 16), max(16, int(round(nw * scale / 16)) * 16))
+
+
+def _fit_encode_image(image, vae, H, W, cache, key, fit_mode="crop", scale=1.0, virtual=None):
     """Pixel-space source prep (blur-proof path): center-crop the IMAGE to the
     target AR, resize to the exact target pixel grid, VAE-encode. Latent-space
     resizing (the old fallback) softens VAE latents — this path never resizes
     latents at all. Cached per target resolution (encode once, not per step)."""
-    key = key + (fit_mode,)
+    key = key + (fit_mode, scale)
     if key in cache:
         return cache[key]
     print(f"[krea2edit] _fit_encode_image: mode={fit_mode} in={tuple(image.shape)} target_latent={H}x{W}", flush=True)
@@ -124,6 +142,11 @@ def _fit_encode_image(image, vae, H, W, cache, key, fit_mode="crop"):
             ch2, cw2 = min(ih, max(1, int(round(nh / sc)))), min(iw, max(1, int(round(nw / sc))))
             y0, x0 = (ih - ch2) // 2, (iw - cw2) // 2
             img = img[..., y0:y0 + ch2, x0:x0 + cw2]
+        if virtual is not None:
+            virtual[key] = (nh // 16, nw // 16)  # the fitted grid (patch tokens) the positions span
+        if scale < 1.0:
+            nh, nw = _scaled_grid(nh, nw, scale)
+            print(f"[krea2edit] ref scaled to {nh}x{nw}px (scale {scale})", flush=True)
         img = F.interpolate(img.float(), size=(nh, nw), mode="bicubic", antialias=True)
         lat = vae.encode(img.movedim(1, -1)[..., :3].clamp(0, 1))
         cache[key] = lat
@@ -164,7 +187,7 @@ def _boost_attention_mode():
 
 def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options,
                        ref_boost=1.0, ref_boost_a=1.0, ref_boost_mask=None,
-                       ref_native=False, pos_mode="anchor"):
+                       ref_native=False, pos_mode="anchor", ref_virtual=None):
     """Krea2 SingleStreamDiT._forward, but with source block(s) prepended.
 
     m           : the SingleStreamDiT (LoRA-patched at sample time)
@@ -219,7 +242,10 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     device = combined.device
     if pos_mode == "stride1" and ref_native:
         print(f"[krea2edit] STRIDE1-POS fit: ref grids {src_grids} centered in ({h_},{w_})", flush=True)
-        ref_ids = [_imgids_offset(bs, i + 1, gh, gw, h_, w_, device)
+        virt = list(ref_virtual or []) + [None] * len(src_grids)
+        ref_ids = [_imgids_offset(bs, i + 1, gh, gw, h_, w_, device) if virt[i] is None
+                   or tuple(virt[i]) == (gh, gw)
+                   else _imgids_scaled(bs, i + 1, gh, gw, virt[i][0], virt[i][1], h_, w_, device)
                    for i, (gh, gw) in enumerate(src_grids)]
     else:
         ref_ids = [_imgids(bs, i + 1, gh, gw, device) for i, (gh, gw) in enumerate(src_grids)]
@@ -232,9 +258,16 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
 
     attn_bias = None
     override = None
-    if ref_boost != 1.0 or ref_boost_a != 1.0:
-        # last ref = subject (single-ref: the only ref); earlier refs (scene) get ref_boost_a
-        boosts = [ref_boost_a] * (len(src_imgs) - 1) + [ref_boost]
+    # last ref = subject (single-ref: the only ref); earlier refs (scene) get ref_boost_a
+    boosts = [ref_boost_a] * (len(src_imgs) - 1) + [ref_boost]
+    if ref_virtual and pos_mode == "stride1" and ref_native:
+        # a downscaled ref has fewer keys: scale its boost by the token ratio so the
+        # target still puts the same attention mass on it as on the full-size ref
+        for i, (gh, gw) in enumerate(src_grids):
+            v = ref_virtual[i] if i < len(ref_virtual) else None
+            if v is not None and tuple(v) != (gh, gw):
+                boosts[i] *= (v[0] * v[1]) / (gh * gw)
+    if any(b != 1.0 for b in boosts):
         slens = [si.shape[1] for si in src_imgs]
         if _boost_attention_mode() == "dense":
             attn_bias = _ref_attn_bias(boosts, ref_boost_mask, txtlen, slens, tgtlen,
@@ -292,6 +325,8 @@ class Krea2EditModelPatch:
             # declared last on purpose: appending keeps every existing socket index put,
             # so workflows saved before this input still reload with their links intact.
             "target_latent": ("LATENT", {"tooltip": "RECOMMENDED with vae + source_image: wire the SAME latent you feed KSampler.latent_image. Lets the node VAE-encode the source here, before sampling starts, instead of on the first step — otherwise the VAE is pulled onto the GPU mid-sampling and can evict part of the diffusion model, slowing every remaining step on VRAM-tight setups"}),
+            "ref_scale_a": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 1.0, "step": 0.05,
+                                      "tooltip": "EXPERIMENTAL (fit mode, pixel path): render the FIRST ref (source_image) at this fraction of its fitted size, laid over the same target area with a wider position stride; fewer tokens -> faster. Its boost is scaled by the token ratio. 1.0 = off"}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -301,7 +336,7 @@ class Krea2EditModelPatch:
 
     def patch(self, model, source_latent, source_latent_b=None, ref_boost=1.0, ref_boost_a=1.0,
               ref_boost_mask=None, vae=None, source_image=None,
-              source_image_b=None, fit_mode="fit", target_latent=None, **_future):
+              source_image_b=None, fit_mode="fit", target_latent=None, ref_scale_a=1.0, **_future):
         if _future:
             print(f"[krea2edit] WARNING: workflow provides inputs this node version does not "
                   f"know ({', '.join(sorted(_future))}). The workflow is newer than the "
@@ -315,6 +350,8 @@ class Krea2EditModelPatch:
             src_samples = [src_samples, model.model.process_latent_in(source_latent_b["samples"])]
 
         px_cache = {}   # pixel-path encoded sources, keyed per target resolution
+        px_virtual = {}  # pixel-path fitted grid per cache key (scaled refs)
+        scale_a = float(ref_scale_a) if fit_mode == "fit" else 1.0
         mm = model.model  # for process_latent_in on the pixel path
         state = {"announced": False}
 
@@ -336,7 +373,7 @@ class Krea2EditModelPatch:
                 Hh, Ww = target_latent["samples"].shape[-2], target_latent["samples"].shape[-1]
                 print(f"[krea2edit] pre-encoding sources at target {Hh * 8}x{Ww * 8}px "
                       f"(before sampling, fit_mode={fit_mode})", flush=True)
-                _fit_encode_image(source_image, vae, Hh, Ww, px_cache, ("a", Hh, Ww), fit_mode)
+                _fit_encode_image(source_image, vae, Hh, Ww, px_cache, ("a", Hh, Ww), fit_mode, scale_a, px_virtual)
                 if source_image_b is not None:
                     _fit_encode_image(source_image_b, vae, Hh, Ww, px_cache, ("b", Hh, Ww), fit_mode)
                 primed = (Hh, Ww)
@@ -362,6 +399,7 @@ class Krea2EditModelPatch:
                         break
             dm = executor.class_obj  # the SingleStreamDiT instance
             src = src_samples
+            virtual = None
             if vae is not None and source_image is not None:
                 xx = _to_4d(x)
                 Hh, Ww = xx.shape[-2], xx.shape[-1]
@@ -375,7 +413,8 @@ class Krea2EditModelPatch:
                               f"sampling is at {Hh * 8}x{Ww * 8}px — the pre-encode is unused and the VAE "
                               f"will run mid-sampling. Wire the SAME latent that feeds KSampler.",
                               flush=True)
-                lat = mm.process_latent_in(_fit_encode_image(source_image, vae, Hh, Ww, px_cache, ("a", Hh, Ww), fit_mode))
+                lat = mm.process_latent_in(_fit_encode_image(source_image, vae, Hh, Ww, px_cache, ("a", Hh, Ww), fit_mode, scale_a, px_virtual))
+                virtual = [px_virtual.get(("a", Hh, Ww, fit_mode, scale_a))]
                 if source_image_b is not None:
                     lat = [lat, mm.process_latent_in(_fit_encode_image(source_image_b, vae, Hh, Ww, px_cache, ("b", Hh, Ww), fit_mode))]
                 src = lat
@@ -384,7 +423,8 @@ class Krea2EditModelPatch:
                                    ref_boost_mask=ref_boost_mask,
                                    ref_native=(fit_mode == "fit" and vae is not None
                                                and source_image is not None),
-                                   pos_mode=("stride1" if fit_mode == "fit" else "anchor"))
+                                   pos_mode=("stride1" if fit_mode == "fit" else "anchor"),
+                                   ref_virtual=(virtual if scale_a < 1.0 else None))
             return v
 
         to = m.model_options.setdefault("transformer_options", {})
