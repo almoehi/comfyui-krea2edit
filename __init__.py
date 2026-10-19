@@ -13,7 +13,7 @@ Wiring:  LoadImage -> VAEEncode(source) --\
          UNETLoader -> LoraLoaderModelOnly -/
 KSampler.latent_image <- EmptySD3LatentImage (noise). Text: NATIVE krea2 CLIP + CLIPTextEncode.
 """
-import math
+import os
 
 import torch
 import torch.nn.functional as F
@@ -24,7 +24,10 @@ import comfy.utils
 import comfy.ldm.common_dit
 from comfy.ldm.flux.layers import timestep_embedding
 from comfy.ldm.flux.math import apply_rope
-from comfy.ldm.modules.attention import optimized_attention_masked
+from comfy.ldm.modules.attention import attention_pytorch
+
+from .ref_boost_attn import (boost_column_logits, dense_bias_from_logits,
+                             make_boost_override)
 
 
 def _imgids(bs, frame, h_, w_, device):
@@ -143,29 +146,20 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
     (last entry = last ref = the subject by workflow convention). Equivalent to
     multiplying those keys' post-softmax attention weight before renormalization.
     boost_mask (ComfyUI MASK, ref-image pixel space) restricts the LAST ref's boost
-    to a region (e.g. the face).
+    to a region (e.g. the face). Dense (1, 1, L, L) form — only used by the
+    KREA2EDIT_BOOST_ATTENTION=dense fallback; the default path computes the same
+    biased attention without a mask (ref_boost_attn.py).
     """
-    nsrc = len(slens)
-    offs = [txtlen]
-    for sl in slens:
-        offs.append(offs[-1] + sl)
-    rows0 = offs[-1]
-    L = rows0 + tgtlen
-    bias = torch.zeros(1, 1, L, L, device=device, dtype=dtype)
-    for i, b in enumerate(boosts):
-        if b == 1.0:
-            continue
-        off, sl = offs[i], slens[i]
-        if boost_mask is not None and i == nsrc - 1 and mask_hw is not None:
-            mask = boost_mask[:1]
-            if mask.ndim == 2:
-                mask = mask[None]
-            mask = F.interpolate(mask[None].float(), size=mask_hw[i], mode="area")[0, 0]
-            cols = off + torch.nonzero(mask.reshape(-1) > 0.5, as_tuple=True)[0].to(device)
-        else:
-            cols = torch.arange(off, off + sl, device=device)
-        bias[:, :, rows0:, cols] = math.log(max(b, 1e-4))
-    return bias
+    w, rows0 = boost_column_logits(boosts, boost_mask, txtlen, slens, mask_hw, device)
+    return dense_bias_from_logits(w, rows0, tgtlen, dtype)
+
+
+def _boost_attention_mode():
+    """'maskless' (default: the boosted attention from maskless fused-kernel calls,
+    ref_boost_attn.make_boost_override) or 'dense' (the original (L, L) bias mask, set
+    KREA2EDIT_BOOST_ATTENTION=dense — for A/B comparisons)."""
+    mode = os.environ.get("KREA2EDIT_BOOST_ATTENTION", "maskless").strip().lower()
+    return "dense" if mode == "dense" else "maskless"
 
 
 def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options,
@@ -237,15 +231,35 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     freqs = m.pe_embedder(pos)
 
     attn_bias = None
+    override = None
     if ref_boost != 1.0 or ref_boost_a != 1.0:
         # last ref = subject (single-ref: the only ref); earlier refs (scene) get ref_boost_a
         boosts = [ref_boost_a] * (len(src_imgs) - 1) + [ref_boost]
-        attn_bias = _ref_attn_bias(boosts, ref_boost_mask, txtlen,
-                                   [si.shape[1] for si in src_imgs], tgtlen,
-                                   src_grids, combined.device, combined.dtype)
+        slens = [si.shape[1] for si in src_imgs]
+        if _boost_attention_mode() == "dense":
+            attn_bias = _ref_attn_bias(boosts, ref_boost_mask, txtlen, slens, tgtlen,
+                                       src_grids, combined.device, combined.dtype)
+        else:
+            w, rows0 = boost_column_logits(boosts, ref_boost_mask, txtlen, slens,
+                                           src_grids, combined.device)
+            override = make_boost_override(
+                w, rows0, combined.shape[1], attention_pytorch,
+                transformer_options.get("optimized_attention_override"))
 
-    for block in m.blocks:
-        combined = block(combined, tvec, freqs, attn_bias, transformer_options=transformer_options)
+    # The override is installed only around the block loop (txtfusion above stays as is)
+    # and the caller's own override is restored afterwards.
+    prev_override = transformer_options.get("optimized_attention_override")
+    if override is not None:
+        transformer_options["optimized_attention_override"] = override
+    try:
+        for block in m.blocks:
+            combined = block(combined, tvec, freqs, attn_bias, transformer_options=transformer_options)
+    finally:
+        if override is not None:
+            if prev_override is None:
+                transformer_options.pop("optimized_attention_override", None)
+            else:
+                transformer_options["optimized_attention_override"] = prev_override
 
     final = m.last(combined, t)
     out = final[:, txtlen + srclen: txtlen + srclen + tgtlen, :]         # target tokens only

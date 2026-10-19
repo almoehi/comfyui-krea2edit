@@ -94,6 +94,7 @@ def _load_pack():
         "comfyui_krea2edit_pre_encode_test", os.path.join(_PACK, "__init__.py")
     )
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod  # as ComfyUI does: lets the pack's relative imports resolve
     spec.loader.exec_module(mod)
     return mod
 

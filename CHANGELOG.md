@@ -4,6 +4,20 @@ Weights: https://huggingface.co/conradlocke/krea2-identity-edit
 v1.2 updates the **nodes** (see below); they stay backward-compatible with v1/v1.1
 weights via `fit_mode: crop`.
 
+## Unreleased (almoehi fork, branch flash-ref-boost)
+
+### Changed
+- **`ref_boost` / `ref_boost_a` no longer use a dense (L, L) attention mask** (#6). The
+  boost is the same additive log(b) bias, computed from maskless fused-kernel calls
+  (`ref_boost_attn.py`): the target rows' attention is merged from one call per key
+  group of equal boost using the kernels' log-sum-exp (cuDNN, else Flash); the other
+  rows are an ordinary maskless call on the active backend. Without a log-sum-exp kernel
+  (CPU, MPS, fp32, older torch) the bias rides two extra head dims (head_dim 136) in one
+  maskless SDPA call. Same outputs within bf16 noise (`tests/test_ref_boost_equivalence.py`);
+  the boosted forward now runs at the speed of an unboosted one (4-block real-width
+  forward, torch 2.13: L40S -18%, H100 -8%). `KREA2EDIT_BOOST_ATTENTION=dense` restores
+  the original masked path. No node input changes.
+
 ## v1.2.5 — 2026-07-29
 
 ### Added
